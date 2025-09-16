@@ -1,2 +1,2 @@
-# font_recognition
-Machine learning font recognition project
+# Write2Text
+This project is designed to take handwritten text and convert it to printed text (English). The ml/inbox stores code for training and inferencing machine learning models, as well as data and notebooks for experimentation. The backend/ folder contains the API for FastAPI, which accepts images and returns results. The frontend will implement an interface for uploading images and displaying text. The tests/ folder contains tests to verify that the project components are working.
