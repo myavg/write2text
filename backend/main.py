@@ -2,12 +2,12 @@ import os
 import base64
 import tempfile
 import shutil
-from datetime import datetime
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from ml.preprocessing import TextSegmenter
+from ml.ocr import OCRModel
 
 app = FastAPI()
 
@@ -20,6 +20,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Initialize OCR model (lazy loading)
+_ocr_model = None
+
+def get_ocr_model():
+    """Get or initialize OCR model."""
+    global _ocr_model
+    if _ocr_model is None:
+        try:
+            _ocr_model = OCRModel()
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Failed to load OCR model: {str(e)}"
+            )
+    return _ocr_model
+
 @app.get("/")
 def root():
     return {"status": "ok", "message": "Backend is running"}
@@ -27,7 +43,7 @@ def root():
 @app.post("/segment")
 async def segment_text(file: UploadFile = File(...)):
     """Process uploaded image and return all word frames as base64 images.
-    Word frames are also saved to storage/frames directory."""
+    Word frames are also saved into the frames directory, replacing any previous data."""
     try:
         # Save uploaded file temporarily (preserve original extension)
         file_ext = Path(file.filename).suffix if file.filename else ".png"
@@ -42,14 +58,17 @@ async def segment_text(file: UploadFile = File(...)):
             segmenter = TextSegmenter()
             segmenter.process_and_save(tmp_path, output_dir)
             
-            # Prepare storage directory
+            # Prepare frames directory (clear previous session)
             BASE_DIR = Path(__file__).parent.parent
-            storage_dir = BASE_DIR / "storage" / "frames"
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            session_dir = storage_dir / timestamp
-            session_dir.mkdir(parents=True, exist_ok=True)
+            frames_dir = BASE_DIR / "frames"
+            frames_dir.mkdir(parents=True, exist_ok=True)
+            for item in frames_dir.iterdir():
+                if item.is_dir():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
             
-            # Collect all word frames and copy to storage
+            # Collect all word frames and copy to frames directory
             word_frames = []
             row_dirs = sorted(Path(output_dir).glob("row_*"), key=lambda x: int(x.name.split("_")[1]))
             
@@ -61,8 +80,8 @@ async def segment_text(file: UploadFile = File(...)):
                         img_bytes = f.read()
                         img_base64 = base64.b64encode(img_bytes).decode("utf-8")
                     
-                    # Copy to storage
-                    storage_row_dir = session_dir / row_dir.name
+                    # Copy to frames directory
+                    storage_row_dir = frames_dir / row_dir.name
                     storage_row_dir.mkdir(exist_ok=True)
                     storage_path = storage_row_dir / word_file.name
                     shutil.copy2(word_file, storage_path)
@@ -77,11 +96,25 @@ async def segment_text(file: UploadFile = File(...)):
         # Clean up temp file
         os.unlink(tmp_path)
         
+        # Perform OCR on all word frames
+        recognized_text = ""
+        try:
+            ocr_model = get_ocr_model()
+            recognized_text = ocr_model.predict_directory(frames_dir)
+        except HTTPException:
+            # Re-raise HTTP exceptions (e.g., model loading errors)
+            raise
+        except Exception as e:
+            # Log error but don't fail the request for OCR prediction errors
+            print(f"OCR error: {str(e)}")
+            recognized_text = f"[OCR Error: {str(e)}]"
+        
         return JSONResponse({
             "status": "success",
             "word_count": len(word_frames),
             "word_frames": word_frames,
-            "storage_path": str(session_dir.relative_to(BASE_DIR))
+            "recognized_text": recognized_text,
+            "storage_path": str(frames_dir.relative_to(BASE_DIR))
         })
     
     except Exception as e:

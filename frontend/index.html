@@ -243,6 +243,15 @@
                     <h2 class="results-title">Extracted Word Frames</h2>
                     <span class="word-count" id="wordCount">0 words</span>
                 </div>
+                
+                <div id="recognizedTextSection" style="margin-top: 30px; margin-bottom: 30px;">
+                    <h3 style="color: #333; margin-bottom: 15px;">📄 Recognized Text</h3>
+                    <div style="background: #f8f9ff; border-radius: 10px; padding: 20px; border: 2px solid #667eea;">
+                        <pre id="recognizedText" style="white-space: pre-wrap; word-wrap: break-word; font-family: inherit; font-size: 1.1em; line-height: 1.6; color: #333; margin: 0;"></pre>
+                    </div>
+                    <button class="upload-btn" id="copyBtn" style="margin-top: 15px; padding: 10px 30px; font-size: 0.9em;">Copy Text</button>
+                </div>
+                
                 <div class="word-frames" id="wordFrames"></div>
             </div>
         </div>
@@ -260,6 +269,9 @@
         const resultsSection = document.getElementById('resultsSection');
         const wordFrames = document.getElementById('wordFrames');
         const wordCount = document.getElementById('wordCount');
+        const recognizedTextSection = document.getElementById('recognizedTextSection');
+        const recognizedText = document.getElementById('recognizedText');
+        const copyBtn = document.getElementById('copyBtn');
 
         const API_URL = 'http://localhost:8000/segment';
 
@@ -350,6 +362,14 @@
             wordCount.textContent = `${data.word_count} word${data.word_count !== 1 ? 's' : ''}`;
             wordFrames.innerHTML = '';
 
+            // Display recognized text
+            if (data.recognized_text) {
+                recognizedText.textContent = data.recognized_text;
+                recognizedTextSection.style.display = 'block';
+            } else {
+                recognizedTextSection.style.display = 'none';
+            }
+
             let currentRow = -1;
             data.word_frames.forEach((frame, index) => {
                 // Add row separator if new row
@@ -374,6 +394,23 @@
 
             resultsSection.style.display = 'block';
         }
+
+        // Copy text button
+        copyBtn.addEventListener('click', () => {
+            const text = recognizedText.textContent;
+            navigator.clipboard.writeText(text).then(() => {
+                const originalText = copyBtn.textContent;
+                copyBtn.textContent = '✓ Copied!';
+                copyBtn.style.background = 'linear-gradient(135deg, #4caf50 0%, #45a049 100%)';
+                setTimeout(() => {
+                    copyBtn.textContent = originalText;
+                    copyBtn.style.background = 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)';
+                }, 2000);
+            }).catch(err => {
+                console.error('Failed to copy text:', err);
+                alert('Failed to copy text to clipboard');
+            });
+        });
 
         function showError(message) {
             errorMessage.textContent = message;
