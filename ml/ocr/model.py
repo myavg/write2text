@@ -1,303 +1,177 @@
-import os
-import math
-import torch
-import torch.nn as nn
-from torch.nn import Conv2d, MaxPool2d, BatchNorm2d, LeakyReLU
-from torchvision import transforms
-import cv2
-import numpy as np
+from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 from PIL import Image
 from pathlib import Path
-
-# Константы модели
-ALPHABET = ['PAD', 'SOS', ' ', '!', '"', '%', '(', ')', ',', '-', '.', '/',
-            '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ':', ';', '?',
-            '[', ']', '«', '»', 'А', 'Б', 'В', 'Г', 'Д', 'Е', 'Ж', 'З', 'И',
-            'Й', 'К', 'Л', 'М', 'Н', 'О', 'П', 'Р', 'С', 'Т', 'У', 'Ф', 'Х',
-            'Ц', 'Ч', 'Ш', 'Щ', 'Э', 'Ю', 'Я', 'а', 'б', 'в', 'г', 'д', 'е',
-            'ж', 'з', 'и', 'й', 'к', 'л', 'м', 'н', 'о', 'п', 'р', 'с', 'т',
-            'у', 'ф', 'х', 'ц', 'ч', 'ш', 'щ', 'ъ', 'ы', 'ь', 'э', 'ю', 'я',
-            'ё', 'EOS']
-
-HIDDEN = 512
-ENC_LAYERS = 2
-DEC_LAYERS = 2
-N_HEADS = 4
-DROPOUT = 0.2
-WIDTH = 256
-HEIGHT = 64
-CHANNELS = 1
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-idx2char = {idx: char for idx, char in enumerate(ALPHABET)}
-
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout=0.1, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        self.scale = nn.Parameter(torch.ones(1))
-
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(
-            0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        self.register_buffer('pe', pe)
-
-    def forward(self, x):
-        x = x + self.scale * self.pe[:x.size(0), :]
-        return self.dropout(x)
-
-
-class TransformerModel(nn.Module):
-    def __init__(self, outtoken, hidden, enc_layers=1, dec_layers=1, nhead=1, dropout=0.1):
-        super(TransformerModel, self).__init__()
-
-        self.enc_layers = enc_layers
-        self.dec_layers = dec_layers
-        self.backbone_name = 'conv(64)->conv(64)->conv(128)->conv(256)->conv(256)->conv(512)->conv(512)'
-
-        self.conv0 = Conv2d(1, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
-        self.conv1 = Conv2d(64, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
-        self.conv2 = Conv2d(128, 256, kernel_size=(3, 3), stride=(2, 1), padding=(1, 1))
-        self.conv3 = Conv2d(256, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
-        self.conv4 = Conv2d(256, 512, kernel_size=(3, 3), stride=(2, 1), padding=(1, 1))
-        self.conv5 = Conv2d(512, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
-        self.conv6 = Conv2d(512, 512, kernel_size=(2, 1), stride=(1, 1))
-        
-        self.pool1 = MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
-        self.pool3 = MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
-        self.pool5 = MaxPool2d(kernel_size=(2, 2), stride=(2, 1), padding=(0, 1), dilation=1, ceil_mode=False)
-
-        self.bn0 = BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
-        self.bn1 = BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
-        self.bn2 = BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
-        self.bn3 = BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
-        self.bn4 = BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
-        self.bn5 = BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
-        self.bn6 = BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
-
-        self.activ = LeakyReLU()
-
-        self.pos_encoder = PositionalEncoding(hidden, dropout)
-        self.decoder = nn.Embedding(outtoken, hidden)
-        self.pos_decoder = PositionalEncoding(hidden, dropout)
-        self.transformer = nn.Transformer(d_model=hidden, nhead=nhead, num_encoder_layers=enc_layers,
-                                          num_decoder_layers=dec_layers, dim_feedforward=hidden * 4, dropout=dropout)
-
-        self.fc_out = nn.Linear(hidden, outtoken)
-        self.src_mask = None
-        self.trg_mask = None
-        self.memory_mask = None
-
-    def generate_square_subsequent_mask(self, sz):
-        mask = torch.triu(torch.ones(sz, sz, device=DEVICE), 1)
-        mask = mask.masked_fill(mask == 1, float('-inf'))
-        return mask
-
-    def make_len_mask(self, inp):
-        return (inp == 0).transpose(0, 1)
-    
-    def _get_features(self, src):
-        '''
-        params
-        ---
-        src : Tensor [64, 3, 64, 256] : [B,C,H,W]
-            B - batch, C - channel, H - height, W - width
-        returns
-        ---
-        x : Tensor : [W,B,CH]
-        '''
-        x = self.activ(self.bn0(self.conv0(src)))
-        x = self.pool1(self.activ(self.bn1(self.conv1(x))))
-        x = self.activ(self.bn2(self.conv2(x)))
-        x = self.pool3(self.activ(self.bn3(self.conv3(x))))
-        x = self.activ(self.bn4(self.conv4(x)))
-        x = self.pool5(self.activ(self.bn5(self.conv5(x))))
-        x = self.activ(self.bn6(self.conv6(x)))
-        x = x.permute(0, 3, 1, 2).flatten(2).permute(1, 0, 2)
-        return x
-
-    def predict(self, batch):
-        '''
-        params
-        ---
-        batch : Tensor [64, 3, 64, 256] : [B,C,H,W]
-            B - batch, C - channel, H - height, W - width
-        
-        returns
-        ---
-        result : List [64, -1] : [B, -1]
-            preticted sequences of tokens' indexes
-        '''
-        result = []
-        for item in batch:
-            x = self._get_features(item.unsqueeze(0))
-            memory = self.transformer.encoder(self.pos_encoder(x))
-            out_indexes = [ALPHABET.index('SOS'), ]
-            for i in range(100):
-                trg_tensor = torch.LongTensor(out_indexes).unsqueeze(1).to(DEVICE)
-                output = self.fc_out(self.transformer.decoder(self.pos_decoder(self.decoder(trg_tensor)), memory))
-
-                out_token = output.argmax(2)[-1].item()
-                out_indexes.append(out_token)
-                if out_token == ALPHABET.index('EOS'):
-                    break
-            result.append(out_indexes)
-        return result
-
-    def forward(self, src, trg):
-        '''
-        params
-        ---
-        src : Tensor [64, 3, 64, 256] : [B,C,H,W]
-            B - batch, C - channel, H - height, W - width
-        trg : Tensor [13, 64] : [L,B]
-            L - max length of label
-        '''
-        if self.trg_mask is None or self.trg_mask.size(0) != len(trg):
-            self.trg_mask = self.generate_square_subsequent_mask(len(trg)).to(trg.device) 
-
-        x = self._get_features(src)
-        src_pad_mask = self.make_len_mask(x[:, :, 0])
-        src = self.pos_encoder(x)
-        trg_pad_mask = self.make_len_mask(trg)
-        trg = self.decoder(trg)
-        trg = self.pos_decoder(trg)
-
-        output = self.transformer(src, trg, src_mask=self.src_mask, tgt_mask=self.trg_mask,
-                                  memory_mask=self.memory_mask,
-                                  src_key_padding_mask=src_pad_mask, tgt_key_padding_mask=trg_pad_mask,
-                                  memory_key_padding_mask=src_pad_mask)
-        output = self.fc_out(output)
-
-        return output
-
-
-def indicies_to_text(indexes, idx2char):
-    """Convert indices to text."""
-    text = "".join([idx2char[i] for i in indexes])
-    text = text.replace('EOS', '').replace('PAD', '').replace('SOS', '').replace('1000В', '').replace('1) Функция', '')
-    return text
-
-
-def process_image(img):
-    """
-    Resize and normalize image for OCR model.
-    params:
-    ---
-    img : np.array
-    returns
-    ---
-    img : np.array
-    """
-    w, h, _ = img.shape
-    new_w = HEIGHT
-    new_h = int(h * (new_w / w))
-    img = cv2.resize(img, (new_h, new_w))
-    w, h, _ = img.shape
-
-    img = img.astype('float32')
-
-    new_h = WIDTH
-    if h < new_h:
-        add_zeros = np.full((w, new_h - h, 3), 255)
-        img = np.concatenate((img, add_zeros), axis=1)
-
-    if h > new_h:
-        img = cv2.resize(img, (new_h, new_w))
-
-    return img
+import torch
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Tuple
 
 
 class OCRModel:
-    """Wrapper class for OCR model."""
+    """OCR модель на основе TrOCR для распознавания русского текста."""
     
-    def __init__(self, model_weights_path=None):
+    def __init__(self, model_name: str = "raxtemur/trocr-base-ru", local_model_path: str = None):
         """
-        Initialize OCR model.
+        Инициализация модели OCR.
         
         Args:
-            model_weights_path: Path to model weights file. If None, looks for model_weights.pth in project root.
+            model_name: Название модели из HuggingFace
+            local_model_path: Локальный путь к модели (если None, используется models/ в корне проекта)
         """
-        if model_weights_path is None:
-            # Try to find model_weights.pth in project root
+        self.model_name = model_name
+        
+        # Определяем путь к локальной модели
+        if local_model_path is None:
+            # Используем директорию models в корне проекта
             BASE_DIR = Path(__file__).parent.parent.parent
-            model_weights_path = BASE_DIR / "model_weights.pth"
+            local_model_path = BASE_DIR / "models" / model_name.replace("/", "_")
         
-        if not os.path.exists(model_weights_path):
-            raise FileNotFoundError(f"Model weights not found at {model_weights_path}")
+        self.local_model_path = Path(local_model_path)
         
-        # Create model
-        self.model = TransformerModel(
-            len(ALPHABET), 
-            hidden=HIDDEN, 
-            enc_layers=ENC_LAYERS, 
-            dec_layers=DEC_LAYERS,   
-            nhead=N_HEADS, 
-            dropout=DROPOUT
-        ).to(DEVICE)
-        
-        # Load weights
-        self.model.load_state_dict(torch.load(model_weights_path, map_location=torch.device(DEVICE)))
-        self.model.eval()
-        
-        # Setup transforms
-        self.test_transform = transforms.Compose([
-            transforms.Grayscale(CHANNELS),
-            transforms.Resize((HEIGHT, WIDTH)),
-            transforms.ToTensor(),
-        ])
+        print(f"Загрузка модели {model_name}...")
+        try:
+            # Проверяем, есть ли модель локально
+            if self.local_model_path.exists() and any(self.local_model_path.iterdir()):
+                print(f"Используется локальная модель из {self.local_model_path}")
+                model_path = str(self.local_model_path)
+                local_files_only = True
+            else:
+                print(f"Модель не найдена локально, загружаем из HuggingFace...")
+                model_path = model_name
+                local_files_only = False
+                # Создаем директорию для сохранения
+                self.local_model_path.mkdir(parents=True, exist_ok=True)
+            
+            # Загружаем processor и model
+            self.processor = TrOCRProcessor.from_pretrained(
+                model_path, 
+                local_files_only=local_files_only
+            )
+            self.model = VisionEncoderDecoderModel.from_pretrained(
+                model_path,
+                local_files_only=local_files_only
+            )
+            
+            # Если модель загружена из HuggingFace, сохраняем локально
+            if not local_files_only:
+                print(f"Сохранение модели в {self.local_model_path}...")
+                self.processor.save_pretrained(str(self.local_model_path))
+                self.model.save_pretrained(str(self.local_model_path))
+                print("Модель сохранена локально!")
+            
+            # Переводим модель в режим оценки (не обучения)
+            self.model.eval()
+            print("Модель успешно загружена!")
+        except Exception as e:
+            print(f"Ошибка загрузки модели: {str(e)}")
+            raise e
     
-    def predict_image(self, img_path):
+    def predict(self, image_path: str) -> str:
         """
-        Predict text from a single image.
+        Распознает текст на изображении.
         
         Args:
-            img_path: Path to image file
+            image_path: Путь к изображению
             
         Returns:
-            Predicted text string
+            Распознанный текст
         """
-        img = Image.open(img_path).convert('RGB')
-        img_tensor = self.test_transform(img).unsqueeze(0).to(DEVICE)
+        try:
+            image = Image.open(image_path).convert("RGB")
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Файл {image_path} не найден")
         
+        # Подготовка изображения
+        pixel_values = self.processor(images=image, return_tensors="pt").pixel_values
+        
+        # Генерация текста
         with torch.no_grad():
-            out_indexes = self.model.predict(img_tensor)
+            generated_ids = self.model.generate(pixel_values)
         
-        predicted_text = indicies_to_text(out_indexes[0], idx2char)
-        return predicted_text
+        generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        return generated_text
     
-    def predict_directory(self, directory_path):
+    def predict_directory(self, frames_dir: Path, max_workers: int = 4) -> str:
         """
-        Predict text from all images in a directory (sorted by row and word).
+        Проходит по всем word frames в директории и склеивает распознанный текст.
+        Использует параллельную обработку для ускорения.
+        Структура директории: frames/row_0/word_0.png, row_0/word_1.png, row_1/word_0.png, ...
         
         Args:
-            directory_path: Path to directory containing row_X/word_Y.png structure
+            frames_dir: Путь к директории с frames
+            max_workers: Количество параллельных потоков (по умолчанию 4)
             
         Returns:
-            Full recognized text string
+            Склеенный текст со всех frames
         """
-        result_text = ""
-        directory = Path(directory_path)
+        frames_dir = Path(frames_dir)
+        if not frames_dir.exists():
+            raise ValueError(f"Директория {frames_dir} не существует")
         
-        # Get all row directories sorted
-        row_dirs = sorted(directory.glob("row_*"), key=lambda x: int(x.name.split("_")[1]))
+        # Собираем все word frames, отсортированные по row и word
+        word_frames = []
+        row_dirs = sorted(frames_dir.glob("row_*"), key=lambda x: int(x.name.split("_")[1]))
         
         for row_dir in row_dirs:
-            # Get all word images sorted
             word_files = sorted(row_dir.glob("word_*.png"), key=lambda x: int(x.stem.split("_")[1]))
-            
             for word_file in word_files:
-                predicted_text = self.predict_image(word_file)
-                result_text += predicted_text + " "
-            
-            # Add newline after each row (except last)
-            if row_dir != row_dirs[-1]:
-                result_text += "\n"
+                row_num = int(row_dir.name.split("_")[1])
+                word_num = int(word_file.stem.split("_")[1])
+                word_frames.append((row_num, word_num, str(word_file)))
         
-        return result_text.strip()
+        if not word_frames:
+            return ""
+        
+        print(f"Обработка {len(word_frames)} изображений в {max_workers} потоках...")
+        
+        # Распознаем текст параллельно
+        results_dict = {}  # {(row_num, word_num): text}
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Запускаем все задачи
+            future_to_frame = {
+                executor.submit(self.predict, word_file): (row_num, word_num)
+                for row_num, word_num, word_file in word_frames
+            }
+            
+            # Собираем результаты по мере выполнения
+            completed = 0
+            for future in as_completed(future_to_frame):
+                row_num, word_num = future_to_frame[future]
+                try:
+                    word_text = future.result()
+                    results_dict[(row_num, word_num)] = word_text.strip()
+                    completed += 1
+                    if completed % 10 == 0:
+                        print(f"Обработано: {completed}/{len(word_frames)}")
+                except Exception as e:
+                    print(f"Ошибка распознавания (row={row_num}, word={word_num}): {str(e)}")
+                    results_dict[(row_num, word_num)] = ""
+        
+        print(f"Обработка завершена: {completed}/{len(word_frames)}")
+        
+        # Собираем результаты в правильном порядке
+        result_lines = []
+        current_row = None
+        current_line_words = []
+        
+        for row_num, word_num, _ in word_frames:
+            if current_row is not None and row_num != current_row:
+                if current_line_words:
+                    result_lines.append(" ".join(current_line_words))
+                current_line_words = []
+            
+            word_text = results_dict.get((row_num, word_num), "")
+            if word_text:  # Добавляем только непустые слова
+                current_line_words.append(word_text)
+            
+            current_row = row_num
+        
+        # Добавляем последнюю строку
+        if current_line_words:
+            result_lines.append(" ".join(current_line_words))
+        
+        # Склеиваем все строки через перенос строки
+        result_text = "\n".join(result_lines)
+        
+        return result_text
 

@@ -20,21 +20,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize OCR model (lazy loading)
+# Initialize OCR model
 _ocr_model = None
 
 def get_ocr_model():
     """Get or initialize OCR model."""
     global _ocr_model
     if _ocr_model is None:
-        try:
-            _ocr_model = OCRModel()
-        except Exception as e:
-            raise HTTPException(
-                status_code=500, 
-                detail=f"Failed to load OCR model: {str(e)}"
-            )
+        raise HTTPException(
+            status_code=503,
+            detail="OCR model is not initialized. Please wait for the service to start."
+        )
     return _ocr_model
+
+@app.on_event("startup")
+async def startup_event():
+    """Инициализация модели OCR при запуске сервиса."""
+    global _ocr_model
+    try:
+        print("Инициализация OCR модели...")
+        _ocr_model = OCRModel()
+        print("OCR модель успешно инициализирована!")
+    except Exception as e:
+        print(f"КРИТИЧЕСКАЯ ОШИБКА: Не удалось загрузить OCR модель: {str(e)}")
+        raise e
 
 @app.get("/")
 def root():
