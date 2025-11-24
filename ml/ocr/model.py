@@ -6,22 +6,20 @@ from typing import List, Tuple, Dict
 
 
 class OCRModel:
-    """OCR модель на основе TrOCR с поддержкой пакетной обработки (Batching)."""
-
+    """OCR model based on TrOCR with batch processing support."""
     def __init__(self, model_name: str = "raxtemur/trocr-base-ru", local_model_path: str = None):
         """
-        Инициализация модели OCR.
+        Initializing the OCR model.
         """
         self.model_name = model_name
 
-        # Определение устройства (GPU или CPU или MPS)
         if torch.cuda.is_available():
             self.device = "cuda"
         elif torch.backends.mps.is_available():
             self.device = "mps"
         else:
             self.device = "cpu"
-        print(f"Устройство для вычислений: {self.device.upper()}")
+        print(f"Device for computing: {self.device.upper()}")
 
         # Определяем путь к локальной модели
         if local_model_path is None:
@@ -30,14 +28,14 @@ class OCRModel:
 
         self.local_model_path = Path(local_model_path)
 
-        print(f"Загрузка модели {model_name}...")
+        print(f"Loading the model {model_name}...")
         try:
             if self.local_model_path.exists() and any(self.local_model_path.iterdir()):
-                print(f"Используется локальная модель из {self.local_model_path}")
+                print(f"A local model is used from {self.local_model_path}")
                 model_path = str(self.local_model_path)
                 local_files_only = True
             else:
-                print(f"Модель не найдена локально, загружаем из HuggingFace...")
+                print(f"Model not found locally, loading from HuggingFace...")
                 model_path = model_name
                 local_files_only = False
                 self.local_model_path.mkdir(parents=True, exist_ok=True)
@@ -51,28 +49,28 @@ class OCRModel:
                 local_files_only=local_files_only
             )
 
-            # Переносим модель на GPU, если есть
+            # Transfer the model to the GPU, if available
             self.model.to(self.device)
 
             if not local_files_only:
-                print(f"Сохранение модели в {self.local_model_path}...")
+                print(f"Saving the model in {self.local_model_path}...")
                 self.processor.save_pretrained(str(self.local_model_path))
                 self.model.save_pretrained(str(self.local_model_path))
 
             self.model.eval()
-            print("Модель успешно загружена!")
+            print("Model loaded successfully!")
         except Exception as e:
-            print(f"Ошибка загрузки модели: {str(e)}")
+            print(f"Error loading model: {str(e)}")
             raise e
 
     def predict_batch(self, image_paths: List[str]) -> List[str]:
         """
-        Распознает текст для списка путей к изображениям за один проход (батч).
+        Recognizes text for a list of image paths in a single pass (batch).
         """
         images = []
-        valid_indices = []  # Чтобы отслеживать, какие картинки загрузились успешно
+        valid_indices = []  # To track which images have loaded successfully
 
-        # Загружаем картинки в память
+        # Loading images into memory
         for idx, path in enumerate(image_paths):
             try:
                 img = Image.open(path).convert("RGB")
@@ -80,23 +78,23 @@ class OCRModel:
                 valid_indices.append(idx)
             except Exception as e:
                 print(f"Ошибка открытия файла {path}: {e}")
-                # Если файл битый, мы его пропускаем, на выходе будет пустая строка для него
+                # If the file is broken, we skip it, the output will be an empty line for it.
 
         if not images:
             return [""] * len(image_paths)
 
-        # Подготовка батча процессором
-        # processor сам сделает ресайз и нормализацию для списка картинок
+        # Preparing the batch with the processor
+        # The processor will automatically resize and normalize the image list
         pixel_values = self.processor(images=images, return_tensors="pt").pixel_values.to(self.device)
 
-        # Генерация текста для всего батча
+        # Generating text for the entire batch
         with torch.no_grad():
             generated_ids = self.model.generate(pixel_values)
 
-        # Декодирование
+        # Decoding
         batch_texts = self.processor.batch_decode(generated_ids, skip_special_tokens=True)
 
-        # Собираем полный список результатов, учитывая ошибки загрузки
+        # We collect a complete list of results, taking into account loading errors
         final_results = [""] * len(image_paths)
         for i, original_idx in enumerate(valid_indices):
             final_results[original_idx] = batch_texts[i]
@@ -105,19 +103,19 @@ class OCRModel:
 
     def predict_directory(self, frames_dir: Path, batch_size: int = 16) -> str:
         """
-        Проходит по всем word frames в директории и склеивает распознанный текст.
-        Использует BATCH PROCESSING вместо потоков.
+        Iterates through all word frames in a directory and concatenates the recognized text.
+        Uses BATCH PROCESSING instead of streams.
 
         Args:
-            frames_dir: Путь к директории с frames
-            batch_size: Размер пачки.
+        frames_dir: Path to the frames directory
+        batch_size: Batch size.
         """
         frames_dir = Path(frames_dir)
         if not frames_dir.exists():
-            raise ValueError(f"Директория {frames_dir} не существует")
-
-        # 1. Сбор всех файлов и метаданных
-        # Список кортежей: (row_num, word_num, absolute_path)
+            raise ValueError(f"Directory {frames_dir} does not exist")
+        
+        # 1. Collect all files and metadata
+        # List of tuples: (row_num, word_num, absolute_path)
         word_frames = []
         row_dirs = sorted(frames_dir.glob("row_*"), key=lambda x: int(x.name.split("_")[1]))
 
@@ -132,36 +130,36 @@ class OCRModel:
             return ""
 
         total_files = len(word_frames)
-        print(f"Найдено {total_files} изображений. Начало обработки батчами по {batch_size}...")
+        print(f"{total_files} images found. Starting processing in batches of {batch_size}...")
 
         results_dict = {}  # {(row_num, word_num): text}
 
-        # 2. Обработка батчами
-        # Идем по списку с шагом batch_size
+        # 2. Batch processing
+        # We go through the list in batch_size increments
         for i in range(0, total_files, batch_size):
-            # Вырезаем кусок списка (батч)
+            # Cut out a piece of the list (batch)
             current_batch_meta = word_frames[i: i + batch_size]
 
-            # Достаем только пути для модели
+            # We only get the paths for the model
             batch_paths = [meta[2] for meta in current_batch_meta]
 
-            # Предсказываем
-            print(f"Обработка батча {i // batch_size + 1}/{(total_files + batch_size - 1) // batch_size}...")
+            # Predict
+            print(f"Batch processing {i // batch_size + 1}/{(total_files + batch_size - 1) // batch_size}...")
             batch_predictions = self.predict_batch(batch_paths)
 
-            # Сохраняем результаты
+            # Saving the results
             for j, text in enumerate(batch_predictions):
                 row_n, word_n, _ = current_batch_meta[j]
                 results_dict[(row_n, word_n)] = text.strip()
 
-        print("Обработка завершена.")
+        print("Processing complete.")
 
-        # 3. Склейка текста (логика осталась прежней)
+        #3. Text gluing (the logic remains the same)        
         result_lines = []
         current_row = None
         current_line_words = []
 
-        # word_frames уже отсортирован по row и word при сборе
+        # word_frames is already sorted by row and word when collected
         for row_num, word_num, _ in word_frames:
             if current_row is not None and row_num != current_row:
                 if current_line_words:
@@ -179,6 +177,6 @@ class OCRModel:
 
         return "\n".join(result_lines)
 
-    # Оставим метод для одиночного файла для совместимости
+    # Let's leave the method for a single file for compatibility
     def predict(self, image_path: str) -> str:
         return self.predict_batch([image_path])[0]

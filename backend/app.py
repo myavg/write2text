@@ -35,14 +35,14 @@ def get_ocr_model():
 
 @app.on_event("startup")
 async def startup_event():
-    """Инициализация модели OCR при запуске сервиса."""
+    """Initializing the OCR model when starting the service."""
     global _ocr_model
     try:
-        print("Инициализация OCR модели...")
+        print("Initializing the OCR model...")
         _ocr_model = OCRModel()
-        print("OCR модель успешно инициализирована!")
+        print("OCR model initialized successfully!")
     except Exception as e:
-        print(f"КРИТИЧЕСКАЯ ОШИБКА: Не удалось загрузить OCR модель: {str(e)}")
+        print(f"CRITICAL ERROR: Failed to load OCR model: {str(e)}")
         raise e
 
 @app.get("/")

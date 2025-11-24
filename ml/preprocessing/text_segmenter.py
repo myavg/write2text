@@ -1,31 +1,30 @@
 import os
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
 from sklearn.cluster import KMeans
 
 
 class TextSegmenter:
-    def __init__(self, pad: int = 20):
-        self.pad = pad
+    def __init__(self):
         self.img = None
         self.img_binary = None
 
-    # ---------------- загрузка и deskew ----------------
+    # ---------------- Download and deskew ----------------
     def load_image(self, path: str):
         img = cv2.imread(path, cv2.IMREAD_COLOR)
         if img is None:
             raise FileNotFoundError(f"Cannot open image: {path}")
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = cv2.copyMakeBorder(
-            img, self.pad, self.pad, self.pad, self.pad,
-            cv2.BORDER_CONSTANT, value=(255, 255, 255)
-        )
         self.img = img
         img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        _, img_binary = cv2.threshold(img_gray, 0, 255, cv2.THRESH_OTSU)
-        self.img_binary = 255 - img_binary
+        ret, img_binary = cv2.threshold(img_gray, 0, 255, cv2.THRESH_OTSU)
+
+        values, counts = np.unique(img_binary, return_counts=True)
+        background_color = values[np.argmax(counts).item()].item()
+        if background_color == 255:
+            img_binary = 255 - img_binary
+        self.img_binary = img_binary
 
     @staticmethod
     def detect_text_skew_angle(img_binary):
@@ -75,51 +74,11 @@ class TextSegmenter:
         return 0
 
     # ---------------- merge_close_contours ----------------
-    def merge_close_contours(self, row):
+    def merge_close_contours(self, row, hor_dist_thr):
         def change_format(box):
             x, y, w, h = box
             return [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
 
-        def adaptive_threshold_clustering(distances_list, multiplier=2):
-            if np.all(distances_list == distances_list[0]):
-                return distances_list[0]
-            q25, q75 = np.percentile(distances_list, [25, 75])
-            iqr = q75 - q25
-            multiplier = 1.8 if iqr > q25 else 1.5
-            upper_bound = q75 + multiplier * iqr
-            reasonable_upper_limit = max(50, upper_bound)
-            filtered = distances_list[distances_list <= reasonable_upper_limit].reshape(-1, 1)
-            kmeans = KMeans(n_clusters=2, init='k-means++', random_state=42, n_init=10)
-            labels = kmeans.fit_predict(filtered)
-            centers = kmeans.cluster_centers_.flatten()
-            sorted_indices = np.argsort(centers)
-            large_cluster_idx = sorted_indices[1]
-            large_cluster_values = filtered[labels == large_cluster_idx]
-            return float(np.min(large_cluster_values))
-
-        used = set()
-        d = np.array([])
-        group_tail = None
-        for i in range(len(row)):
-            if i in used:
-                continue
-            if group_tail:
-                d = np.append(d, row[i][0] - group_tail)
-            group_tail = row[i][0] + row[i][2]
-            used.add(i)
-            queue = [i]
-            while queue:
-                current_idx = queue.pop(0)
-                for j in range(len(row)):
-                    if j in used:
-                        continue
-                    distance_hor = self.calculate_rect_distance(row[current_idx], row[j])
-                    if distance_hor == 0:
-                        group_tail = max(group_tail, row[j][0] + row[j][2])
-                        used.add(j)
-                        queue.append(j)
-
-        hor_dist_thr = adaptive_threshold_clustering(d)
         groups = []
         used = set()
         for i in range(len(row)):
@@ -176,8 +135,11 @@ class TextSegmenter:
         return contours
 
     def group_contours_histogram(self, contours, bins=50):
-        bboxes = [cv2.boundingRect(cnt) for cnt in contours]
-        y_centers = [y + h/2 for _, y, _, h in bboxes]
+        img_area = self.img.shape[0] * self.img.shape[1]
+        bboxes = [cv2.boundingRect(cnt) for cnt in contours if
+                  cv2.boundingRect(cnt)[2] * cv2.boundingRect(cnt)[3] < img_area * 0.6]
+        y_centers = [y + h / 2 for _, y, _, h in bboxes]
+
         hist, bin_edges = np.histogram(y_centers, bins=bins)
         peaks, _ = find_peaks(hist)
         if len(hist) > 1:
@@ -211,7 +173,7 @@ class TextSegmenter:
             row.sort(key=lambda x: x[0])
         return [row for row in rows if row]
 
-    def auto_adjust_bins(self, contours):
+    def auto_adjust_bins(self):
         projection = np.sum(self.img_binary, axis=1)
         threshold = np.max(projection) * 0.25
         in_line, estimated_rows = False, 0
@@ -222,9 +184,75 @@ class TextSegmenter:
                 in_line = False
         return estimated_rows * 3
 
-    # ---------------- процесс и сохранение ----------------
+    def adaptive_threshold_clustering(self, distances_list):
+        if len(distances_list) == 0:
+            return 1
+
+        if np.all(distances_list == distances_list[0]):
+            return distances_list[0]
+
+        q25, q75 = np.percentile(distances_list, [25, 75])
+        iqr = q75 - q25
+
+        if iqr > q25:
+            multiplier = 1.8
+        else:
+            multiplier = 1.5
+
+        upper_bound = q75 + multiplier * iqr
+
+        reasonable_upper_limit = max(50, upper_bound)
+        filtered = distances_list[distances_list <= reasonable_upper_limit].reshape(-1, 1)
+
+        kmeans = KMeans(n_clusters=2, init='k-means++', random_state=42, n_init=10)
+        labels = kmeans.fit_predict(filtered)
+        centers = kmeans.cluster_centers_.flatten()
+        sorted_indices = np.argsort(centers)
+        small_cluster_idx = sorted_indices[0]
+
+        large_cluster_idx = sorted_indices[1]
+
+        large_cluster_values = filtered[labels == large_cluster_idx]
+        if len(large_cluster_values) == 0:
+            large_cluster_values = filtered[labels == small_cluster_idx]
+        threshold = np.min(large_cluster_values)
+
+        return float(threshold)
+
+    def collect_statistic(self, rows):
+        thresholds = []
+        count = 0
+        for row in rows:
+            count += 1
+            used = set()
+            d = np.array([])
+            group_tail = None
+            for i in range(len(row)):
+                if i in used:
+                    continue
+                if group_tail:
+                    d = np.append(d, row[i][0] - group_tail)
+                group_tail = row[i][0] + row[i][2]
+                used.add(i)
+                queue = [i]
+                while queue:
+                    current_idx = queue.pop(0)
+                    for j in range(len(row)):
+                        if j in used:
+                            continue
+                        distance_hor = self.calculate_rect_distance(row[current_idx],
+                                                               row[j])
+                        if distance_hor == 0:
+                            group_tail = max(group_tail, row[j][0] + row[j][2])
+                            used.add(j)
+                            queue.append(j)
+            thresholds.append(self.adaptive_threshold_clustering(d))
+
+        return thresholds
+
+    # ---------------- process and save ----------------
     def process_and_save(self, path: str, output_dir: str):
-        """Выполняет сегментацию и сохраняет фреймы слов в storage."""
+        """Performs segmentation and stores word frames in storage."""
         os.makedirs(output_dir, exist_ok=True)
         self.load_image(path)
         angle = self.detect_text_skew_angle(self.img_binary)
@@ -233,18 +261,25 @@ class TextSegmenter:
             self.img = self.deskew_image(self.img, angle)
 
         contours, _ = cv2.findContours(self.img_binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        bins = self.auto_adjust_bins(contours)
-        sorted_rows = self.group_contours_histogram(contours, bins=bins)
+        bins = self.auto_adjust_bins()
+        sorted_row_contours = self.group_contours_histogram(contours, bins=bins)
 
+        statistics = self.collect_statistic(sorted_row_contours)
+        q10, q90 = np.percentile(statistics, 30), np.percentile(statistics, 90)
+        hor_dist_thrs = np.clip(statistics, q10, q90)
+
+        img_area = self.img.shape[0] * self.img.shape[1]
         frame_count = 0
-        for row_idx, row in enumerate(sorted_rows):
+        for row_idx, row in enumerate(sorted_row_contours):
             row = [cnt for cnt in np.array(row, dtype=np.int32)]
-            merged = self.merge_close_contours(row)
+            merged_contours = self.merge_close_contours(row, hor_dist_thrs[row_idx])
             row_dir = os.path.join(output_dir, f"row_{row_idx}")
             os.makedirs(row_dir, exist_ok=True)
-            for contour_idx, contour in enumerate(merged):
+            for contour_idx, contour in enumerate(merged_contours):
                 x, y, w, h = cv2.boundingRect(contour)
-                crop = self.img[y:y+h, x:x+w]
+                if w * h >= img_area * 0.8:
+                    continue
+                crop = 255 - self.img_binary[y:y+h, x:x+w]
                 out_path = os.path.join(row_dir, f"word_{contour_idx}.png")
                 cv2.imwrite(out_path, cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
                 frame_count += 1
