@@ -1,17 +1,26 @@
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 from PIL import Image
 from pathlib import Path
 import torch
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional, Union
 
 
 class OCRModel:
-    """OCR model based on TrOCR with batch processing support."""
-    def __init__(self, model_name: str = "raxtemur/trocr-base-ru", local_model_path: str = None):
-        """
-        Initializing the OCR model.
-        """
+    def __init__(
+        self, 
+        model_name: str = "raxtemur/trocr-base-ru", 
+        local_model_path: str = None,
+        lora_path: Optional[str] = None,
+        use_lora: bool = False,
+        lora_r: int = 8,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.1,
+        lora_target_modules: Optional[List[str]] = None
+    ):
         self.model_name = model_name
+        self.use_lora = use_lora
+        self.lora_path = lora_path
 
         if torch.cuda.is_available():
             self.device = "cuda"
@@ -49,6 +58,18 @@ class OCRModel:
                 local_files_only=local_files_only
             )
 
+            if self.use_lora:
+                if lora_path and Path(lora_path).exists():
+                    self.model = PeftModel.from_pretrained(self.model, lora_path)
+                else:
+                    self.model = self._apply_lora(
+                        self.model, 
+                        lora_r, 
+                        lora_alpha, 
+                        lora_dropout, 
+                        lora_target_modules
+                    )
+
             # Transfer the model to the GPU, if available
             self.model.to(self.device)
 
@@ -64,9 +85,6 @@ class OCRModel:
             raise e
 
     def predict_batch(self, image_paths: List[str]) -> List[str]:
-        """
-        Recognizes text for a list of image paths in a single pass (batch).
-        """
         images = []
         valid_indices = []  # To track which images have loaded successfully
 
@@ -102,14 +120,6 @@ class OCRModel:
         return final_results
 
     def predict_directory(self, frames_dir: Path, batch_size: int = 16) -> str:
-        """
-        Iterates through all word frames in a directory and concatenates the recognized text.
-        Uses BATCH PROCESSING instead of streams.
-
-        Args:
-        frames_dir: Path to the frames directory
-        batch_size: Batch size.
-        """
         frames_dir = Path(frames_dir)
         if not frames_dir.exists():
             raise ValueError(f"Directory {frames_dir} does not exist")
@@ -176,6 +186,62 @@ class OCRModel:
             result_lines.append(" ".join(current_line_words))
 
         return "\n".join(result_lines)
+
+    def _apply_lora(
+        self, 
+        model: VisionEncoderDecoderModel,
+        r: int = 8,
+        alpha: int = 32,
+        dropout: float = 0.1,
+        target_modules: Optional[List[str]] = None
+    ) -> VisionEncoderDecoderModel:
+        if target_modules is None:
+            target_modules = ["q_proj", "v_proj", "k_proj", "out_proj", "fc1", "fc2"]
+        
+        lora_config = LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION,
+            r=r,
+            lora_alpha=alpha,
+            lora_dropout=dropout,
+            target_modules=target_modules,
+            bias="none",
+            modules_to_save=None,
+        )
+        
+        model = get_peft_model(model, lora_config)
+        
+        return model
+
+    def save_lora_adapters(self, save_path: str) -> None:
+        if not self.use_lora:
+            raise ValueError("LoRA is not enabled. Cannot save adapters.")
+        
+        if hasattr(self.model, 'save_pretrained'):
+            save_path = Path(save_path)
+            save_path.mkdir(parents=True, exist_ok=True)
+            
+            if isinstance(self.model, PeftModel):
+                self.model.save_pretrained(str(save_path))
+            else:
+                self.model.save_pretrained(str(save_path))
+        else:
+            raise ValueError("Model does not support saving LoRA adapters.")
+
+    def enable_training_mode(self) -> None:
+        if self.use_lora:
+            self.model.train()
+        else:
+            raise ValueError("LoRA is not enabled. Cannot enable training mode.")
+
+    def disable_training_mode(self) -> None:
+        self.model.eval()
+
+    def get_trainable_parameters(self) -> int:
+        if self.use_lora:
+            trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            return trainable_params
+        else:
+            return sum(p.numel() for p in self.model.parameters())
 
     # Let's leave the method for a single file for compatibility
     def predict(self, image_path: str) -> str:
